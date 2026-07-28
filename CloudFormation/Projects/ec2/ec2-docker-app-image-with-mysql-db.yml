@@ -1,0 +1,171 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Free-tier EC2 instance that installs Docker on boot, starts a MySQL
+  container, waits for it to actually be ready, then starts your app
+  container on the same Docker network so it can reach MySQL by container
+  name. Deploy one stack per app microservice that needs its own database.
+
+Parameters:
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: prod-product-service-key
+    Description: Existing EC2 key pair, for SSH access.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: >
+      Your default VPC ID in ap-south-2. Find it with:
+      aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --region ap-south-2
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: A subnet inside that VPC with "Auto-assign public IPv4" enabled.
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t2.micro]
+    Description: t3.micro is the free-tier instance type in ap-south-2 (t2 family isn't available there).
+
+  DockerImage:
+    Type: String
+    Default: vamshivoore/spring-order-service:latest
+    Description: Your app's Docker Hub image.
+
+  ContainerPort:
+    Type: Number
+    Default: 8080
+    Description: Port the app listens on inside its container.
+
+  HostPort:
+    Type: Number
+    Default: 8083
+    Description: Port exposed on the EC2 instance (matches your local -p 8083:8080).
+
+  EnvVars:
+    Type: String
+    Default: "SPRING_DATASOURCE_URL=jdbc:mysql://mysql-db:3306/order_db?createDatabaseIfNotExist=true,SPRING_DATASOURCE_USERNAME=root,SPRING_DATASOURCE_PASSWORD=root"
+    Description: Comma-separated KEY=VALUE pairs passed to the app container. "mysql-db" resolves via the shared Docker network below.
+
+  MySQLImage:
+    Type: String
+    Default: mysql:8.0
+
+  MySQLDatabase:
+    Type: String
+    Default: order_db
+
+  MySQLRootPassword:
+    Type: String
+    Default: root
+    NoEcho: true
+    Description: >
+      Hidden in the CloudFormation console/CLI output, but NOT a real secret —
+      it's still readable in plain text by anyone who can read this instance's
+      UserData via the EC2 API. Fine for learning; for anything real, use
+      Secrets Manager instead (a later lesson).
+
+  SSHLocationCIDR:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR allowed to SSH in. Get your IP from https://checkip.amazonaws.com and use "<that-ip>/32" once you know it.
+
+Resources:
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "Allow SSH and app traffic for ${AWS::StackName}"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocationCIDR
+        - IpProtocol: tcp
+          FromPort: !Ref HostPort
+          ToPort: !Ref HostPort
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-sg"
+      # Note: MySQL's 3306 is deliberately NOT opened here or published on the
+      # host — the app reaches mysql-db over the private Docker network only,
+      # so the database is never exposed to the internet.
+
+  ServiceInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref ServiceSecurityGroup
+      # Dynamic SSM reference — always resolves to the latest Amazon Linux 2023
+      # AMI for whatever region you deploy in, so you never hardcode an AMI ID.
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-instance"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          dnf update -y
+          dnf install -y docker
+          systemctl enable docker
+          systemctl start docker
+          usermod -aG docker ec2-user
+
+          # Private network so containers can resolve each other by name
+          # (mirrors your local --network app-network)
+          docker network create app-network
+
+          # ---- 1. Start MySQL first ----
+          docker run -d --name mysql-db \
+            --network app-network \
+            -e MYSQL_ROOT_PASSWORD=${MySQLRootPassword} \
+            -e MYSQL_DATABASE=${MySQLDatabase} \
+            --restart unless-stopped \
+            ${MySQLImage}
+
+          # ---- 2. Wait until MySQL is actually accepting connections ----
+          # "docker started" and "MySQL ready to accept connections" are not the
+          # same moment — MySQL takes 15-30s to initialize on first boot. This
+          # loop is what your local setup was implicitly relying on manual
+          # timing for.
+          echo "Waiting for MySQL to be ready..."
+          for i in $(seq 1 30); do
+            if docker exec mysql-db mysqladmin ping -uroot -p${MySQLRootPassword} --silent; then
+              echo "MySQL is ready."
+              break
+            fi
+            echo "MySQL not ready yet, retrying in 5s... ($i/30)"
+            sleep 5
+          done
+
+          # ---- 3. Turn "KEY1=VAL1,KEY2=VAL2" into "-e KEY1=VAL1 -e KEY2=VAL2" ----
+          RAW_ENV="${EnvVars}"
+          ENV_FLAGS=""
+          for pair in $(echo "$RAW_ENV" | tr ',' ' '); do
+            ENV_FLAGS="$ENV_FLAGS -e $pair"
+          done
+
+          # ---- 4. Start the app, same network, so "mysql-db" resolves ----
+          docker pull ${DockerImage}
+          docker run -d --name app \
+            --network app-network \
+            --restart unless-stopped \
+            -p ${HostPort}:${ContainerPort} \
+            $ENV_FLAGS \
+            ${DockerImage}
+
+Outputs:
+  InstanceId:
+    Value: !Ref ServiceInstance
+
+  PublicIP:
+    Value: !GetAtt ServiceInstance.PublicIp
+
+  ServiceURL:
+    Description: Give this 1-2 minutes after CREATE_COMPLETE — MySQL's readiness loop adds startup time.
+    Value: !Sub "http://${ServiceInstance.PublicDnsName}:${HostPort}"
