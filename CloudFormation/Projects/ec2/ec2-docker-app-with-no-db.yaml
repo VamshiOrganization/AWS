@@ -1,0 +1,115 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Free-tier EC2 instance that installs Docker on boot and runs a single
+  container from Docker Hub.
+
+Parameters:
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing EC2 key pair for SSH access. Select your key pair during stack deployment.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Pick your Default VPC from the dropdown list.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Pick a subnet belonging to the selected VPC (must have public IP auto-assigned).
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t2.micro, t3.micro]
+    Description: t2.micro/t3.micro are both in the AWS free tier.
+
+  DockerImage:
+    Type: String
+    Default: vamshivoore/inventory-service:latest
+    Description: Docker Hub image to pull and run.
+
+  ContainerPort:
+    Type: Number
+    Default: 8080
+    Description: Port the app listens on inside the container.
+
+  HostPort:
+    Type: Number
+    Default: 8081
+    Description: Port exposed on the host EC2 instance.
+
+  EnvVars:
+    Type: String
+    Default: ""
+    Description: Comma-separated KEY=VALUE pairs if needed. Leave blank if none.
+
+  SSHLocationCIDR:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR allowed to SSH in.
+
+Resources:
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "Allow SSH and app traffic for ${AWS::StackName}"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocationCIDR
+        - IpProtocol: tcp
+          FromPort: !Ref HostPort
+          ToPort: !Ref HostPort
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-sg"
+
+  ServiceInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref ServiceSecurityGroup
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-instance"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          dnf update -y
+          dnf install -y docker
+          systemctl enable docker
+          systemctl start docker
+          usermod -aG docker ec2-user
+
+          # Turn "KEY1=VAL1,KEY2=VAL2" into "-e KEY1=VAL1 -e KEY2=VAL2"
+          RAW_ENV="${EnvVars}"
+          ENV_FLAGS=""
+          if [ -n "$RAW_ENV" ]; then
+            for pair in $(echo "$RAW_ENV" | tr ',' ' '); do
+              ENV_FLAGS="$ENV_FLAGS -e $pair"
+            done
+          fi
+
+          docker pull ${DockerImage}
+          docker run -d --name app --restart unless-stopped \
+            -p ${HostPort}:${ContainerPort} \
+            $ENV_FLAGS \
+            ${DockerImage}
+
+Outputs:
+  InstanceId:
+    Value: !Ref ServiceInstance
+
+  PublicIP:
+    Value: !GetAtt ServiceInstance.PublicIp
+
+  ServiceURL:
+    Description: Access your containerized service here
+    Value: !Sub "http://${ServiceInstance.PublicDnsName}:${HostPort}"
