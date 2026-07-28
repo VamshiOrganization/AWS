@@ -1,5 +1,5 @@
-[~ Back to CloudFormation](../../cloudFormation.md)
-
+[<~ Back to CloudFormation](../../cloudFormation.md)
+[<~ ec2-docker-app-with-no-db](ec2-docker-app-with-no-db.yaml)
 ### Parameters Section
 
 -   **`AWSTemplateFormatVersion`**: Specifies the version of the CloudFormation template structure being used (always `2010-09-09`).
