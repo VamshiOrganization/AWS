@@ -1,5 +1,7 @@
 - [<~ Back to CloudFormation](../../cloudFormation.md)
-- [<~ ec2-docker-app-with-no-db](ec2-docker-app-with-no-db.yaml)
+- [<~ ec2-docker-app-with-no-db yaml](ec2-docker-app-with-no-db.yaml)
+- [<~ ec2-docker-app-with-no-db md](ec2-docker-app-with-no-db.md)
+- [<~ ec2-docker-app-image-with-mysql-db](ec2-docker-app-image-with-mysql-db.yml)
 
 #### Remaining properties in this ec2-docker-app-with-no-db.yaml 
 
