@@ -1,0 +1,343 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Real-world-style setup for order-service: custom VPC (2 public subnets,
+  no NAT), shared Application Load Balancer, Auto Scaling Group of app
+  instances, RDS MySQL, and an API Gateway HTTP API in front via VPC Link.
+  Designed so a second service (e.g. inventory-service) can be added later
+  as one more target group + listener rule, reusing the same VPC/ALB/API.
+
+Parameters:
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: prod-product-service-key
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t2.micro]
+
+  DockerImage:
+    Type: String
+    Default: vamshivoore/spring-order-service:latest
+
+  ContainerPort:
+    Type: Number
+    Default: 8080
+
+  HostPort:
+    Type: Number
+    Default: 8083
+
+  HealthCheckPath:
+    Type: String
+    Default: /
+    Description: >
+      ALB health check path. "/" works only if your app returns 2xx there.
+      If you have Spring Actuator enabled, change this to /actuator/health.
+
+  DBName:
+    Type: String
+    Default: order_db
+
+  DBMasterUsername:
+    Type: String
+    Default: admin
+    Description: RDS MySQL rejects "root" as a username — this is the real admin account name instead.
+
+  DBMasterPassword:
+    Type: String
+    Default: ChangeMe12345
+    NoEcho: true
+    MinLength: 8
+    Description: RDS requires 8+ characters. Override this default before any real use.
+
+  AsgMinSize:
+    Type: Number
+    Default: 1
+  AsgMaxSize:
+    Type: Number
+    Default: 2
+  AsgDesiredCapacity:
+    Type: Number
+    Default: 1
+
+  SSHLocationCIDR:
+    Type: String
+    Default: 0.0.0.0/0
+
+  ApiStageName:
+    Type: String
+    Default: v1
+
+Resources:
+
+  # ---------------- Networking ----------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: !Sub "${AWS::StackName}-vpc"}]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # !Select + !GetAZs picks 2 real AZ names for whatever region you deploy
+  # in, so this never breaks if ap-south-2's AZ names differ from another region.
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: !Sub "${AWS::StackName}-public-a"}]
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: !Sub "${AWS::StackName}-public-b"}]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # ---------------- Security groups ----------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - allow HTTP from the internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App instances - only ALB can reach the app port; SSH restricted
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref HostPort
+          ToPort: !Ref HostPort
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocationCIDR
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS - only app instances can reach MySQL, nothing else
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+
+  # ---------------- Database ----------------
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnets for order-service RDS
+      SubnetIds: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+
+  OrderDB:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      Engine: mysql
+      EngineVersion: '8.0'
+      DBInstanceClass: db.t3.micro   # RDS free-tier eligible instance class
+      AllocatedStorage: '20'          # RDS free tier: 20 GB
+      StorageType: gp2
+      DBName: !Ref DBName
+      MasterUsername: !Ref DBMasterUsername
+      MasterUserPassword: !Ref DBMasterPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: [!Ref DbSecurityGroup]
+      PubliclyAccessible: false      # subnet is "public" (has an IGW route) but RDS itself gets no public IP
+      MultiAZ: false                  # single-AZ keeps this in the free tier; flip to true for real prod
+      BackupRetentionPeriod: 1
+
+  # ---------------- Compute: order-service ----------------
+  OrderServiceLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyPairName
+        SecurityGroupIds: [!Ref AppSecurityGroup]
+        ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            dnf update -y
+            dnf install -y docker
+            systemctl enable docker
+            systemctl start docker
+            usermod -aG docker ec2-user
+
+            docker pull ${DockerImage}
+            docker run -d --name app --restart unless-stopped \
+              -p ${HostPort}:${ContainerPort} \
+              -e SPRING_DATASOURCE_URL=jdbc:mysql://${OrderDB.Endpoint.Address}:3306/${DBName} \
+              -e SPRING_DATASOURCE_USERNAME=${DBMasterUsername} \
+              -e SPRING_DATASOURCE_PASSWORD=${DBMasterPassword} \
+              ${DockerImage}
+
+  OrderServiceTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VPC
+      Protocol: HTTP
+      Port: !Ref HostPort
+      TargetType: instance
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  OrderServiceASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: OrderDB   # don't launch app instances until the database exists
+    Properties:
+      VPCZoneIdentifier: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref OrderServiceLaunchTemplate
+        Version: !GetAtt OrderServiceLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref AsgMinSize
+      MaxSize: !Ref AsgMaxSize
+      DesiredCapacity: !Ref AsgDesiredCapacity
+      TargetGroupARNs: [!Ref OrderServiceTargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 120
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-order-service"
+          PropagateAtLaunch: true
+
+  OrderServiceScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref OrderServiceASG
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 60.0
+
+  # ---------------- Load balancer ----------------
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+
+  # Forwards straight to order-service for now since it's the only backend.
+  # When inventory-service joins: change this DefaultActions to a 404
+  # FixedResponse, and add an AWS::ElasticLoadBalancingV2::ListenerRule per
+  # service instead (e.g. path pattern /order/* and /inventory/*).
+  AlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref OrderServiceTargetGroup
+
+  # ---------------- API Gateway (HTTP API) in front of the ALB ----------------
+  ApiVpcLink:
+    Type: AWS::ApiGatewayV2::VpcLink
+    Properties:
+      Name: !Sub "${AWS::StackName}-vpc-link"
+      SubnetIds: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroupIds: [!Ref AlbSecurityGroup]
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      ProtocolType: HTTP
+
+  AlbIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    DependsOn: AlbListener
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref ApiVpcLink
+      IntegrationUri: !Ref AlbListener
+      PayloadFormatVersion: '1.0'
+
+  ProxyRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'ANY /{proxy+}'
+      Target: !Sub "integrations/${AlbIntegration}"
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: !Ref ApiStageName
+      AutoDeploy: true
+
+Outputs:
+  AlbDnsName:
+    Description: Talk to the ALB directly (bypasses API Gateway) for quick testing
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+
+  ApiGatewayUrl:
+    Description: The real front door — routes through API Gateway, VPC Link, then the ALB
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}"
+
+  RdsEndpoint:
+    Value: !GetAtt OrderDB.Endpoint.Address
