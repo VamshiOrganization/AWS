@@ -1,6 +1,7 @@
 Here is the index of topics with their exact page numbers based on the presentation slides:
 
-## Course Index & Map
+## Course Index & Map [PDF](https://docs.google.com/viewer?url=https://raw.githubusercontent.com/VamshiOrganization/AWS/main/Topics/in28minutes/AWSCertifiedDeveloperAssociate-Presentation.pdf#page=98)
+
 
 ### 1. Fundamentals & Getting Started
 
